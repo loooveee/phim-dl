@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+downloads/
+aria2c.exe
+ffmpeg.exe
+# Your login session: never share or commit it.
+session.txt
+cookies.txt
+# Unfinished downloads, in case someone saves into this folder with -o .
+.*.parts/
+*.aria2
+*.part
+*.ts
+*.mp4
+*.srt
+failed.txt
