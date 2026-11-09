@@ -1402,10 +1402,27 @@ def find_ffmpeg() -> Optional[str]:
 
 # Running aria2c / ffmpeg processes, so Ctrl+C stops them too.
 _children: set = set()
+_children_lock = threading.Lock()
+_stopping = False
+
+
+def start_child(cmd: list, **kwargs) -> subprocess.Popen:
+    """Start aria2c / ffmpeg and remember it. Refused after Ctrl+C, so a download thread that is
+    still running cannot start a new process that would outlive phim-dl."""
+    with _children_lock:
+        if _stopping:
+            raise RuntimeError(t("stopped", "đã dừng"))
+        proc = subprocess.Popen(cmd, **kwargs)
+        _children.add(proc)
+    return proc
 
 
 def kill_children() -> None:
-    for proc in list(_children):
+    global _stopping
+    with _children_lock:
+        _stopping = True
+        procs = list(_children)
+    for proc in procs:
         try:
             proc.terminate()
         except Exception:
@@ -1430,18 +1447,25 @@ def make_mp4(ffmpeg: str, out_path: str, chunks: Callable[[], Iterable[bytes]]) 
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "mpegts", "-i", "pipe:0",
                "-map", "0:v?", "-map", "0:a?", "-c", "copy", *extra, "-movflags", "+faststart", "-f", "mp4", tmp]
         with tempfile.TemporaryFile() as err_file:
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                    stdout=subprocess.DEVNULL, stderr=err_file)
-            _children.add(proc)
+            proc = start_child(cmd, stdin=subprocess.PIPE,
+                               stdout=subprocess.DEVNULL, stderr=err_file)
             try:
                 try:
                     for chunk in chunks():
-                        proc.stdin.write(chunk)
-                except OSError:
-                    pass   # ffmpeg stopped early; its error message says why
+                        try:
+                            proc.stdin.write(chunk)
+                        except OSError:
+                            break   # ffmpeg stopped early; its error message says why
                 finally:
-                    proc.stdin.close()
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass    # the pipe is already broken when ffmpeg stopped early
                 code = proc.wait()
+            except BaseException:
+                # A segment could not be read: do not let ffmpeg finish a cut-short file.
+                proc.kill()
+                raise
             finally:
                 _children.discard(proc)
             err_file.seek(0)
@@ -1543,8 +1567,7 @@ def _run_aria2(aria2: str, parts_dir: Path, pending: list[tuple[str, str]],
         "--download-result=hide", "--show-console-readout=false",
         f"--log={parts_dir / 'aria2.log'}", "--log-level=warn",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    _children.add(proc)
+    proc = start_child(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         while True:
             try:
@@ -2060,7 +2083,8 @@ def run(args) -> int:
     log(bold_cyan("phim-dl") + gray(f" v{__version__}"))
     if args.site:
         set_site(args.site)
-    elif args.url and "://" in args.url:
+    elif args.url and ("://" in args.url or re.match(r"(?:[\w-]+\.)+[\w-]+/", args.url.strip())):
+        # Also a link pasted without https:// ("phimsea.com/title/...").
         set_site(args.url)
     if HOST not in KNOWN_SITES:
         warn(t(f"{HOST} is not a known site; trying it anyway.",
@@ -2077,6 +2101,10 @@ def run(args) -> int:
     except NotLoggedIn:
         log(red(t(f"The {HOST} session has expired. Run: {login_hint()}",
                   f"Phiên đăng nhập {HOST} đã hết hạn. Chạy: {login_hint()}")), err=True)
+        return 1
+    except (OSError, ValueError) as ex:
+        # Network errors or an unreadable answer from the site (e.g. while checking the login).
+        log(red(t("Error: ", "Lỗi: ") + describe_error(SITE, ex)), err=True)
         return 1
 
 
