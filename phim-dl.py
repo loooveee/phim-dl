@@ -43,6 +43,7 @@ import argparse
 import base64
 import getpass
 import hashlib
+import http.client
 import http.cookiejar
 import importlib.util
 import json
@@ -446,7 +447,8 @@ def _is_transient(error: Exception) -> bool:
     """Short network problems worth retrying (dropped connection, timeout, busy server)."""
     if isinstance(error, urllib.error.HTTPError):
         return error.code in (429, 500, 502, 503, 504)
-    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError))
+    # http.client errors: the connection was cut in the middle of an answer (IncompleteRead, ...).
+    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException))
 
 
 def http_get(url: str, binary: bool = False, tries: int = 3):
@@ -692,7 +694,8 @@ class Session:
                 raise ValueError(t("the site returned an error: ", "trang báo lỗi: ")
                                  + str(err.get("message", err) if isinstance(err, dict) else err))
             # Unknown id: the site was updated. Read the new ids once and try again.
-            if attempt == 0 and self.find_remote_ids():
+            # (Another thread may have read them in the meantime: then the id used above is old too.)
+            if attempt == 0 and (self.find_remote_ids() or self.remotes.get(name, "") != rid):
                 continue
             raise ValueError(t(f"HTTP {status} from {name}", f"HTTP {status} từ {name}"))
         raise AssertionError("unreachable")
@@ -706,7 +709,7 @@ class Session:
             status, headers, body = self.request(f"/watch/{self.watch_fid}")
             self._check_login(status, headers, body)
             page = body.decode("utf-8", "replace")
-            scripts = sorted(set(re.findall(r'(_app/immutable/nodes/[\w.-]+\.js)', page)),
+            scripts = sorted(set(re.findall(r'(_app/immutable/nodes/\d+[\w.-]*\.js)', page)),
                              key=lambda s: -int(re.search(r"nodes/(\d+)", s).group(1)))
             found = {}
             for script in scripts:
@@ -1251,12 +1254,12 @@ def probe_resolution(stream: Stream, ffmpeg: Optional[str]) -> Optional[tuple[in
 
 def describe_quality(media: dict, stream: Stream, ffmpeg: Optional[str]) -> str:
     """e.g. '1080p (1920x1080)', from the site's media info or else read by ffmpeg."""
-    w, h = (media or {}).get("width"), (media or {}).get("height")
+    w, h = _int((media or {}).get("width"), 0), _int((media or {}).get("height"), 0)
     if not (w and h):
         res = probe_resolution(stream, ffmpeg)
         if res:
             w, h = res
-    return f"{resolution_label(int(w), int(h))} ({w}x{h})" if w and h else t("source", "gốc")
+    return f"{resolution_label(w, h)} ({w}x{h})" if w and h else t("source", "gốc")
 
 
 # --------------------------------------------------------------------------- #
@@ -1281,7 +1284,7 @@ def pick_subtitles(subs: list[dict], wanted: str) -> list[dict]:
         cur = best.get(key)
         if cur is None or score > cur[0]:
             best[key] = (score, sub)
-    order = langs or sorted(best)
+    order = list(dict.fromkeys(langs)) if langs else sorted(best)   # "vi,vi" = "vi"
     return [best[k][1] | {"_lang": k} for k in order if k in best]
 
 
@@ -1329,16 +1332,23 @@ def save_subtitles(sess: Session, fid: str, video_path: str, wanted: str) -> lis
 WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
+def _unreserve(name: str) -> str:
+    """Windows (10 and older) treats CON, NUL, COM1, ... as devices, also when an extension follows:
+    'Con.Air.1997.mp4' is CON there. The part before the first dot gets a '_'."""
+    first, dot, rest = name.partition(".")
+    if first.strip().upper() in WINDOWS_RESERVED:
+        return first.rstrip() + "_" + dot + rest
+    return name
+
+
 def safe_name(name: str) -> str:
-    name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name).strip().rstrip(". ")
-    if name.split(".")[0].upper() in WINDOWS_RESERVED:
-        name += "_"
+    name = _unreserve(re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name).strip().rstrip(". "))
     return name if name not in ("", ".", "..") else "phim"
 
 
 def build_filename(title: str, year: str, ep: Optional[dict]) -> str:
     """Movie.Name.2026.mp4 for a movie, Series.Name.S01E01.mp4 for an episode."""
-    base = re.sub(r"\s+", ".", safe_name(title))
+    base = _unreserve(re.sub(r"\s+", ".", safe_name(title)))   # "Con Air" -> "Con.Air" is reserved again
     if ep is None:
         return f"{base}.{year}.mp4" if year else f"{base}.mp4"
     return f"{base}.S{ep['season']:02d}E{ep['number']:02d}.mp4"
@@ -1465,6 +1475,8 @@ def make_mp4(ffmpeg: str, out_path: str, chunks: Callable[[], Iterable[bytes]]) 
             except BaseException:
                 # A segment could not be read: do not let ffmpeg finish a cut-short file.
                 proc.kill()
+                proc.wait()
+                _remove(tmp)
                 raise
             finally:
                 _children.discard(proc)
@@ -1515,12 +1527,34 @@ DEFAULT_FRAGMENTS = {"aria2": 32, "builtin": 16}
 STALL_TIMEOUT = 12
 
 
+def _listing(folder: Path) -> dict[str, int]:
+    """File name -> size of the files in a folder. Files that go away while it is read are left
+    out: aria2c deletes its .aria2 files and .part files are renamed as segments finish."""
+    sizes: dict[str, int] = {}
+    with os.scandir(folder) as it:
+        for entry in it:
+            try:
+                sizes[entry.name] = entry.stat().st_size
+            except OSError:
+                pass
+    return sizes
+
+
+def _stream_id(stream: Stream) -> str:
+    """Fingerprint of what the segment files of a stream contain: the cut points, the byte ranges
+    and the keys. The links are left out on purpose, they may differ from run to run."""
+    digest = hashlib.sha256()
+    for seg in stream.segments:
+        digest.update(f"{seg.duration!r}|{seg.byte_range}|".encode())
+        digest.update(stream.keys.get(seg.key, b"") if seg.key else b"-")
+    return digest.hexdigest()
+
+
 def _check_parts(parts_dir: Path, stream: Stream, names: list[str], good: set[str]) -> None:
     """Add the finished segments that really are video to `good`; delete broken ones
     (empty files, error pages) and half-downloaded ones so they are downloaded again.
     Half files cannot be continued: the video servers do not support resuming whole files."""
-    with os.scandir(parts_dir) as it:
-        listing = {e.name: e.stat().st_size for e in it}
+    listing = _listing(parts_dir)
     for name in listing:
         if name.endswith((".aria2", ".part")):
             _remove(parts_dir / name)
@@ -1575,8 +1609,7 @@ def _run_aria2(aria2: str, parts_dir: Path, pending: list[tuple[str, str]],
                 finished = True
             except subprocess.TimeoutExpired:
                 finished = False
-            with os.scandir(parts_dir) as it:
-                listing = {e.name: e.stat().st_size for e in it}
+            listing = _listing(parts_dir)
             done = [n for n in names if n in listing and n + ".aria2" not in listing]
             meter.report(len(done), sum(listing[n] for n in done),
                          sum(size for name, size in listing.items() if name in names))
@@ -1628,8 +1661,7 @@ def _run_builtin(parts_dir: Path, pending: list[tuple[str, str, str]], connectio
     try:
         while True:
             finished = not wait(futures, timeout=0.5).not_done
-            with os.scandir(parts_dir) as it:
-                listing = {e.name: e.stat().st_size for e in it}
+            listing = _listing(parts_dir)
             done = [n for n in names if n in listing]
             partial = sum(size for name, size in listing.items() if name.endswith(".part"))
             meter.report(len(done), sum(listing[n] for n in done), sum(listing[n] for n in done) + partial)
@@ -1653,6 +1685,20 @@ def download_segments(aria2: Optional[str], stream: Stream, out_path: str, label
     stem = os.path.splitext(out_path)[0]
     parts_dir = Path(out_path).parent / f".{os.path.basename(stem)}.parts"
     parts_dir.mkdir(exist_ok=True)
+    # Segments kept from an earlier run only fit the same video: another server may cut the movie
+    # differently or use another key, and mixing the two would give a broken file.
+    marker, ident = parts_dir / "stream.id", _stream_id(stream)
+    try:
+        previous = marker.read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        previous = ""
+    if previous and previous != ident:
+        log(f"  {label}: " + gray(t("the video is not the one of the last run (another server?), starting again",
+                                     "video khác với lần chạy trước (server khác?), tải lại từ đầu")))
+        shutil.rmtree(parts_dir, ignore_errors=True)
+        parts_dir.mkdir(exist_ok=True)
+    if previous != ident:
+        marker.write_text(ident, encoding="ascii")
     names = [f"{i:05d}.ts" for i in range(len(stream.segments))]
     good: set[str] = set()
     meter = Meter(label, len(names), expected)
@@ -1884,6 +1930,8 @@ def download_jobs(ready: list[Job], aria2: Optional[str], ffmpeg: Optional[str],
             board.finish(job.label, True, size)
             log(f"  {bold_green('✓')} {bold(job.label)}  {green(os.path.basename(final))}  {gray(fmt_bytes(size))}")
         except Exception as ex:
+            if _stopping:
+                return   # Ctrl+C stopped aria2c / ffmpeg: not a failure of this episode
             job.fail(str(ex))
             board.finish(job.label, False)
             log(f"  {bold_red('✗')} {bold(job.label)}  {red(job.error)}", err=True)
@@ -1990,10 +2038,10 @@ def pick_episodes(sess: Session, info: dict, args) -> list[Optional[dict]]:
     if info["type"] == "episode":
         return [info["episode"]]
 
-    seasons = sorted(info["seasons"], key=lambda s: int(s.get("number") or 0))
+    seasons = sorted(info["seasons"], key=lambda s: _int(s.get("number"), 0))
     if not seasons:
         raise Abort(t("This series has no seasons yet.", "Phim bộ này chưa có mùa nào."))
-    numbers = [int(s.get("number") or i + 1) for i, s in enumerate(seasons)]
+    numbers = [_int(s.get("number"), 0) or i + 1 for i, s in enumerate(seasons)]
     log("  " + gray(t(f"Series · {len(seasons)} season(s): ", f"Phim bộ · {len(seasons)} mùa: ")
                     + ", ".join(f"S{n:02d} ({s.get('episodeCount') or '?'} {t('eps', 'tập')})"
                                 for n, s in zip(numbers, seasons))))
@@ -2073,7 +2121,10 @@ def report_size(ready: list[Job], out_dir: Path) -> None:
     unknown = sum(1 for j in ready if not j.size)
     log("\n" + t("Estimated size: ", "Dung lượng ước tính: ") + bold(f"~{fmt_bytes(total_size)}")
         + (gray(t(f" ({unknown} unknown)", f" (chưa tính {unknown} file không đo được)")) if unknown else ""))
-    free = shutil.disk_usage(out_dir).free
+    try:
+        free = shutil.disk_usage(out_dir).free
+    except OSError:
+        return   # e.g. some network drives
     if free < total_size * 1.05:
         warn(t(f"Only {fmt_bytes(free)} free on this drive, it may not be enough.",
                f"Ổ đĩa chỉ còn trống {fmt_bytes(free)}, có thể không đủ chỗ."))
@@ -2102,7 +2153,7 @@ def run(args) -> int:
         log(red(t(f"The {HOST} session has expired. Run: {login_hint()}",
                   f"Phiên đăng nhập {HOST} đã hết hạn. Chạy: {login_hint()}")), err=True)
         return 1
-    except (OSError, ValueError) as ex:
+    except (OSError, ValueError, http.client.HTTPException) as ex:
         # Network errors or an unreadable answer from the site (e.g. while checking the login).
         log(red(t("Error: ", "Lỗi: ") + describe_error(SITE, ex)), err=True)
         return 1
@@ -2114,7 +2165,7 @@ def download_command(sess: Session, args) -> int:
         kind, fid = parse_target(args.url)
     except ValueError as ex:
         raise Abort(t("Error: ", "Lỗi: ") + str(ex), 2)
-    server = str(args.server or 1)
+    server = str(1 if args.server is None else args.server)
     if server not in SERVERS:
         raise Abort(t(f"The server must be 1 to {len(SERVERS)}.", f"Server phải từ 1 đến {len(SERVERS)}."), 2)
     if not check_dependencies():
